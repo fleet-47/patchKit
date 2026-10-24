@@ -1,0 +1,201 @@
+# Shared zshrs pipeline module. Source: patch-runner/mise/config.toml; each repo pins a copy
+# at .config/mise/config.toml. Repo-specific tasks and overrides live in each repo's mise.toml.
+#
+# Admin tasks run natively on the host. Build tasks need the Termux toolchain and its linker,
+# so they run on device or inside termux-docker (`mise run termux:run <task>`).
+
+[task_config]
+# Task scripts use bash features; the default `sh` is dash on Termux.
+shell = "bash -o errexit -c"
+
+[env]
+# The Termux prefix, on device and inside termux-docker.
+PREFIX = "/data/data/com.termux/files/usr"
+CARGO_HOME = "{{ env.HOME }}/.config/cargo"
+
+[vars]
+# The repo's directory name, for its state and container paths.
+project = "{{ config_root | split(pat='/') | last }}"
+toolchain_repo = "fleet-47/termux-bionicc-aarch64"
+# Each group installs whole from one source: our toolchain release or Termux apt, whichever is newer.
+llvm_pkgs = "clang lld llvm libllvm libcompiler-rt"
+llvm_min_major = 22
+rust_pkgs = "rust rust-std-aarch64-linux-android"
+rust_min_major = 1
+# The newest versioned toolchain release; `none` when there is none or the lookup fails.
+toolchain_tag_cmd = '''t=$(gh api --paginate "repos/{{ vars.toolchain_repo }}/releases" --jq '.[] | select(.draft | not) | select(.prerelease | not) | select(.tag_name | test("^cargo-llvm[0-9]+-clang.+-rust.+$")) | [.published_at, .tag_name] | @tsv' 2>/dev/null | sort -r | head -n 1 | cut -f 2); echo "${t:-none}"'''
+# Termux apt's candidates for each group's lead package.
+toolchain_apt_cmd = '''apt-cache policy clang rust 2>/dev/null | awk '/Candidate:/ {print $2}' | paste -sd _'''
+# Where the toolchain record lives: beside the packages it describes.
+toolchain_dir = "{{ env.PREFIX }}/var/lib/zshrs"
+# Generic Termux packages for termux-docker, always from apt.
+termux_pkgs = "gh jq"
+termux_image = "termux/termux-docker:aarch64"
+termux_container = "termux"
+termux_home = "/data/data/com.termux/files/home"
+termux_repo = "{{ vars.termux_home }}/{{ vars.project }}"
+# Host side of the cached container directories; the Actions cache keeps this between runs.
+termux_host_dir = "{{ config_root }}/.termux"
+# Extra TOML files for `check`; each repo sets its own.
+check_toml = ""
+
+# Admin tasks.
+
+[tasks.check]
+description = "Static checks: TOML syntax, workflow syntax and workflow security"
+# Linux hosts only: none of the three ship Android builds; the device uses its Termux taplo.
+tools = { actionlint = { version = "latest", os = ["linux"] }, taplo = { version = "latest", os = ["linux"] }, zizmor = { version = "latest", os = ["linux"] } }
+run = [
+  "taplo check mise.toml .config/mise/config.toml cargo/config.toml {{ vars.check_toml }}",
+  "actionlint",
+  "zizmor --offline .github/workflows",
+]
+
+[tasks."termux:start"]
+description = "Start termux-docker with the checkout and cached directories mounted at their Termux paths, and install mise and the Termux packages inside"
+run = '''
+set -euo pipefail
+HOST="{{ vars.termux_host_dir }}"
+HOME_T="{{ vars.termux_home }}"
+mkdir -p "$HOST/toolchain" "$HOST/cargo-registry" "$HOST/cargo-git" "$HOST/zshrs-cache"
+# The image's entrypoint drops root to the uid 1000 `system` user.
+chmod -R a+rwX "{{ config_root }}" "$HOST"
+# termux-docker needs seccomp relaxed. Only downloads and upstream's own shell builds are cached:
+# the toolchain's debs, cargo's registry and ~/.cache/zshrs. Installs, records and cargo's config
+# start fresh in every container.
+docker run -d --name "{{ vars.termux_container }}" --privileged \
+  -v "{{ config_root }}:{{ vars.termux_repo }}" \
+  -v "$HOST/toolchain:$HOME_T/.cache/zshrs-toolchain" \
+  -v "$HOST/zshrs-cache:$HOME_T/.cache/zshrs" \
+  -v "$HOST/cargo-registry:$HOME_T/.config/cargo/registry" \
+  -v "$HOST/cargo-git:$HOME_T/.config/cargo/git" \
+  "{{ vars.termux_image }}" tail -f /dev/null
+docker exec "{{ vars.termux_container }}" /entrypoint.sh bash -euo pipefail -c \
+  "apt-get update -q && apt-get install -yq mise {{ vars.termux_pkgs }}"
+'''
+
+[tasks."termux:run"]
+description = "Run a build task inside termux-docker, in the mounted checkout"
+usage = 'arg "<task>" help="The mise task to run inside Termux"'
+run = '''
+set -euo pipefail
+docker exec -e CI -e GH_TOKEN -e MISE_TRUSTED_CONFIG_PATHS="{{ vars.termux_repo }}" "{{ vars.termux_container }}" \
+  /entrypoint.sh bash -euo pipefail -c "umask 022; cd {{ vars.termux_repo }}; mise run {{ usage.task }}"
+'''
+
+[tasks."termux:stop"]
+description = "Remove the termux-docker container"
+run = 'docker rm -f "{{ vars.termux_container }}"'
+
+# Build tasks.
+
+[tasks."cargo:seed"]
+description = "Seed $CARGO_HOME/config.toml from cargo/config.toml only when it does not exist"
+run = '''
+set -euo pipefail
+if [ -e "$CARGO_HOME/config.toml" ]; then
+  echo "==> Using existing $CARGO_HOME/config.toml"
+  exit 0
+fi
+mkdir -p "$CARGO_HOME"
+cp "{{ config_root }}/cargo/config.toml" "$CARGO_HOME/config.toml"
+echo "==> Seeded $CARGO_HOME/config.toml"
+'''
+
+[tasks."toolchain:install"]
+description = "Install each toolchain group from our release or Termux apt, whichever is newer, and record the choice; skipped while the record for the current release and apt candidates exists"
+vars = { toolchain_tag = "{{ exec(command=vars.toolchain_tag_cmd, cache_duration='1h') }}", toolchain_apt = "{{ exec(command=vars.toolchain_apt_cmd) }}" }
+# A new release or apt candidate names a record that does not exist yet, so the task runs again.
+sources = [".config/mise/config.toml"]
+outputs = ["{{ vars.toolchain_dir }}/toolchain/{{ vars.toolchain_tag }}_{{ vars.toolchain_apt }}.env"]
+run = '''
+set -euo pipefail
+REPO="{{ vars.toolchain_repo }}"
+TAG="{{ vars.toolchain_tag }}"
+RECORD="{{ vars.toolchain_dir }}/toolchain/{{ vars.toolchain_tag }}_{{ vars.toolchain_apt }}.env"
+CACHE_DIR="{{ xdg_cache_home }}/zshrs-toolchain"
+
+apt-get update -q
+
+# A failed download counts as no release.
+DIR=""
+if [ "$TAG" != none ]; then
+  DIR="$CACHE_DIR/$TAG"
+  mkdir -p "$DIR"
+  PATTERNS=(--pattern SHA256SUMS-toolchain.txt)
+  for pkg in {{ vars.llvm_pkgs }} {{ vars.rust_pkgs }}; do PATTERNS+=(--pattern "${pkg}_*.deb"); done
+  if gh release download "$TAG" --repo "$REPO" --dir "$DIR" --skip-existing "${PATTERNS[@]}"; then
+    # A downloaded deb that is unlisted or mismatched is an error, not a fallback.
+    (
+      cd "$DIR"
+      for deb in *.deb; do
+        grep -q "  $deb\$" SHA256SUMS-toolchain.txt || { echo "Error: $deb is not in SHA256SUMS-toolchain.txt" >&2; exit 1; }
+      done
+      sha256sum --check --ignore-missing SHA256SUMS-toolchain.txt
+    )
+  else
+    echo "==> $REPO@$TAG download failed; using Termux apt only"
+    DIR=""
+  fi
+else
+  echo "==> No $REPO release found; using Termux apt only"
+fi
+
+upstream() { v="${1#*:}"; echo "${v%-*}"; }
+major() { v=$(upstream "$1"); echo "${v%%.*}"; }
+candidate() { apt-cache policy "$1" | awk '/Candidate:/ {print $2}'; }
+
+# install_group NAME MIN_MAJOR PKG...: the newer of our release and the apt candidate,
+# apt on a tie, neither below MIN_MAJOR. Sets SOURCE and VERSION.
+install_group() {
+  local name=$1 min=$2
+  shift 2
+  local pkgs=("$@") ours="" apt pkg deb missing=0
+  local debs=()
+  if [ -n "$DIR" ]; then
+    for pkg in "${pkgs[@]}"; do
+      deb=$(compgen -G "$DIR/${pkg}_*.deb" | head -n 1) || deb=""
+      if [ -n "$deb" ]; then debs+=("$deb"); else missing=1; fi
+    done
+    # The release counts only when it carries every package in the group.
+    if [ "$missing" -eq 0 ]; then ours=$(dpkg-deb -f "${debs[0]}" Version); fi
+  fi
+  apt=$(candidate "${pkgs[0]}")
+  if [ "$apt" = "(none)" ]; then apt=""; fi
+  if [ -n "$apt" ] && [ "$(major "$apt")" -lt "$min" ]; then apt=""; fi
+  if [ -n "$ours" ] && [ "$(major "$ours")" -lt "$min" ]; then ours=""; fi
+  if [ -n "$apt" ] && { [ -z "$ours" ] || dpkg --compare-versions "$(upstream "$apt")" ge "$(upstream "$ours")"; }; then
+    echo "==> $name: Termux apt $apt"
+    local pinned=()
+    for pkg in "${pkgs[@]}"; do pinned+=("$pkg=$(candidate "$pkg")"); done
+    apt-get install -yq --allow-downgrades "${pinned[@]}"
+    SOURCE=apt VERSION=$apt
+  elif [ -n "$ours" ]; then
+    echo "==> $name: $REPO@$TAG $ours"
+    apt-get install -yq --allow-downgrades "${debs[@]}"
+    SOURCE=$TAG VERSION=$ours
+  else
+    echo "Error: no $name source at major $min or above (release: $TAG, apt: $(candidate "${pkgs[0]}"))" >&2
+    exit 1
+  fi
+}
+
+install_group llvm {{ vars.llvm_min_major }} {{ vars.llvm_pkgs }}
+LLVM_SOURCE=$SOURCE LLVM_VERSION=$VERSION
+install_group rust {{ vars.rust_min_major }} {{ vars.rust_pkgs }}
+RUST_SOURCE=$SOURCE RUST_VERSION=$VERSION
+
+mkdir -p "$(dirname "$RECORD")"
+cat > "$RECORD" <<EOF
+TOOLCHAIN_REPO=$REPO
+TOOLCHAIN_TAG=$TAG
+TOOLCHAIN_LLVM_SOURCE=$LLVM_SOURCE
+TOOLCHAIN_CLANG_VERSION=$LLVM_VERSION
+TOOLCHAIN_RUST_SOURCE=$RUST_SOURCE
+TOOLCHAIN_RUST_VERSION=$RUST_VERSION
+EOF
+# Build tasks read the current record through this link.
+ln -sfn "$RECORD" "{{ vars.toolchain_dir }}/toolchain.env"
+echo "==> Recorded $RECORD"
+cat "$RECORD"
+'''
